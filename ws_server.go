@@ -23,7 +23,7 @@ var connectionToChannel = make(map[*websocket.Conn]chan string)
 var userNameToPassword = make(map[string]string)
 
 var maxChannelSize uint32 = 10
-var addr = flag.String("addr", "localhost:8080", "http service address")
+var addr = flag.String("addr", "0.0.0.0:8080", "http service address")
 
 func getFromUserNameToPassword(key string) (string, bool) {
 	mutexUserNameToPassword.Lock()
@@ -261,6 +261,12 @@ func checkIfUserConnected(userName string) bool {
 	return true
 }
 
+func addNewConnection(connection *websocket.Conn, userName string) {
+	mutex.Lock()
+	addNewConnectionToUserNameToMapConnections(userName, connection)
+	addNewChannelToConnectionToChannel(connection)
+	mutex.Unlock()
+}
 func wsConnection(w http.ResponseWriter, r *http.Request) {
 	upgrader.CheckOrigin = func(r *http.Request) bool {
 		return true
@@ -350,8 +356,7 @@ func wsConnection(w http.ResponseWriter, r *http.Request) {
 
 			if globalUserName == "" {
 				globalUserName = userName
-				addNewConnectionToUserNameToMapConnections(userName, connection)
-				addNewChannelToConnectionToChannel(connection)
+				addNewConnection(connection, userName)
 				defer cleanupAfterConnectionClose(userName, connection)
 				wg.Done()
 				continue

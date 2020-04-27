@@ -15,8 +15,9 @@ import (
 )
 
 var randomReceiverName string = "asbcfjhawkljxqwejhcqihjvgkoelpwdvhgwcpq"
-var globalServerURLHTTP string = "http://localhost:8080"
-var globalServerURLWS string = "ws://localhost:8080"
+var globalServerIP string = "3.7.96.64"
+var globalServerURLHTTP string = "http://" + globalServerIP + ":8080"
+var globalServerURLWS string = "ws://" + globalServerIP + ":8080"
 var globalPrompt string = ">"
 var globalUserName string = ""
 var globalPassword string = ""
