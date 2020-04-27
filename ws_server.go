@@ -2,16 +2,48 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
+	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
 )
+
+/*
+Database Tables:
+
+ CREATE TABLE Authentication (
+    username varchar(100) NOT NULL,
+    password varchar(100) NOT NULL,
+    PRIMARY KEY (username)
+);
+
+CREATE TABLE Messages (
+	id int NOT NULL AUTO_INCREMENT,
+    timestamp varchar(100) NOT NULL,
+    sender varchar(100) NOT NULL,
+    receiver varchar(100) NOT NULL,
+    message varchar(10000) NOT NULL,
+    PRIMARY KEY (id)
+);
+
+*/
+
+var maxUserNameLength int = 100
+var maxPasswordLength int = 100
+var db *sql.DB = nil
+var dbUserName string = "XXXX"
+var dbPassword string = "XXXX"
+var dbName string = "XXXX"
+var dbServerIP string = "XXXX"
 
 var mutexUserNameToMapConnections = &sync.Mutex{}
 var mutexConnectionToChannel = &sync.Mutex{}
@@ -24,6 +56,117 @@ var userNameToPassword = make(map[string]string)
 
 var maxChannelSize uint32 = 10
 var addr = flag.String("addr", "0.0.0.0:8080", "http service address")
+
+func dbAddNewUserNameAndPassword(userName string, password string) (string, bool) {
+	if len(userName) > maxUserNameLength {
+		return "len(userName) should be less than 101!", false
+	}
+	if len(password) > maxPasswordLength {
+		return "len(password) should be less than 101!", false
+	}
+
+	stmt, err := db.Prepare("INSERT INTO Authentication (username, password) VALUES ('" + userName + "','" + password + "');")
+	if err != nil {
+		return err.Error(), false
+	}
+	defer stmt.Close()
+	_, err = stmt.Exec()
+	if err != nil {
+		return err.Error(), false
+	}
+	return "", true
+}
+
+func dbGetPassword(userName string) (string, bool, string, bool) {
+	if len(userName) > maxUserNameLength {
+		return "", false, "len(userName) should be less than 101!", true
+	}
+
+	res, err := db.Query("SELECT password FROM Authentication WHERE username = '" + userName + "';")
+	if err != nil {
+		return "", false, err.Error(), false
+	}
+	defer res.Close()
+	var password string
+	ctr := 0
+	for res.Next() {
+		err = res.Scan(&password)
+		if err != nil {
+			return "", false, string(err.Error()), false
+		}
+		ctr++
+	}
+
+	if ctr == 0 {
+		return "", false, "", true
+	}
+	if ctr > 1 {
+		return "", false, "More than 1 row with same userName found in the messages table!", false
+	}
+	return password, true, "", true
+}
+
+func dbGetLastNMessages(user1 string, user2 string, n int) ([]string, string, bool) {
+	if len(user1) > maxUserNameLength {
+		return []string{}, "Both len(senderName) and len(receiverName) should be less than 101!", false
+	}
+	if len(user2) > maxUserNameLength {
+		return []string{}, "Both len(senderName) and len(receiverName) should be less than 101!", false
+	}
+
+	res, err := db.Query("SELECT * FROM Messages WHERE ((sender = '" + user1 + "' AND receiver = '" + user2 + "') OR (sender = '" + user2 + "' AND receiver = '" + user1 + "')) ORDER BY id DESC LIMIT " + strconv.Itoa(n) + ";")
+	if err != nil {
+		return []string{}, err.Error(), false
+	}
+	defer res.Close()
+	var ans = []string{}
+
+	for res.Next() {
+		var id int
+		var timestamp string
+		var sender string
+		var receiver string
+		var message string
+		err = res.Scan(&id, &timestamp, &sender, &receiver, &message)
+		if err != nil {
+			return []string{}, string(err.Error()), false
+		}
+		ans = append(ans, timestamp+": "+sender+" -> "+receiver+": "+message)
+	}
+
+	var temp = []string{}
+	n = len(ans)
+	for i := n - 1; i >= 0; i-- {
+		temp = append(temp, ans[i])
+	}
+	ans = temp
+	return ans, "", true
+}
+
+func dbInsertNewMessage(sender string, receiver string, message string) (string, bool) {
+	if len(sender) > maxUserNameLength {
+		return "len(sender) should be less than 101!", false
+	}
+
+	if len(receiver) > maxUserNameLength {
+		return "len(receiver) should be less than 101!", false
+	}
+
+	if len(message) > maxUserNameLength {
+		return "len(messageText) should be less than 10001!", false
+	}
+
+	stmt, err := db.Prepare("INSERT INTO Messages (timestamp, sender, receiver, message) VALUES ('" + time.Now().UTC().String() + "','" + sender + "','" + receiver + "','" + message + "');")
+	if err != nil {
+		return err.Error(), false
+	}
+	defer stmt.Close()
+	_, err = stmt.Exec()
+	if err != nil {
+		return err.Error(), false
+	}
+	return "", true
+}
 
 func getFromUserNameToPassword(key string) (string, bool) {
 	mutexUserNameToPassword.Lock()
@@ -60,6 +203,21 @@ func authenticate(r *http.Request) (string, int, bool) {
 	userName, _ := dataDict["userName"]
 	password, _ := dataDict["password"]
 	storedPassword, isPresent := getFromUserNameToPassword(userName)
+
+	if isPresent == false {
+		storedPasswordDb, isPresentDb, errMsg, isSuccessful := dbGetPassword(userName)
+		if isSuccessful == false {
+			message = errMsg
+			statusCode = http.StatusInternalServerError
+			isSuccessful = false
+			return message, statusCode, isSuccessful
+		}
+		if isPresentDb == true {
+			isPresent = true
+			storedPassword = storedPasswordDb
+			putIntoUserNameToPassword(userName, storedPasswordDb)
+		}
+	}
 
 	if (isPresent == false) || ((isPresent == true) && (storedPassword != password)) {
 		jsonResponseByteArr, jsonErr := json.Marshal("Wrong username or password!")
@@ -338,6 +496,23 @@ func wsConnection(w http.ResponseWriter, r *http.Request) {
 			}
 
 			storedPassword, isPresent := getFromUserNameToPassword(userName)
+
+			if isPresent == false {
+				storedPasswordDb, isPresentDb, errMsg, isSuccessful := dbGetPassword(userName)
+				if isSuccessful == false {
+					log.Print(errMsg)
+					if globalUserName == "" {
+						wg.Done()
+					}
+					break
+				}
+				if isPresentDb == true {
+					isPresent = true
+					storedPassword = storedPasswordDb
+					putIntoUserNameToPassword(userName, storedPasswordDb)
+				}
+			}
+
 			if isPresent == false {
 				log.Println("User: " + userName + " has not signed up yet")
 				if globalUserName == "" {
@@ -377,15 +552,19 @@ func wsConnection(w http.ResponseWriter, r *http.Request) {
 
 			storedPassword, isPresent = getFromUserNameToPassword(receiverName)
 			if isPresent == false {
-				pushDataIntoAllChannelsForUser(userName, "User: "+receiverName+" has not signed up yet")
-				log.Println("User: " + receiverName + " has not signed up yet")
-				continue
+				_, isFound, errMsg, isSuccessful := dbGetPassword(receiverName)
+				if isSuccessful == false {
+					log.Print(errMsg)
+					pushDataIntoAllChannelsForUser(userName, "Internal Server Error!")
+				}
+				if isFound == true {
+					isPresent = true
+				}
 			}
 
-			isConnected := checkIfUserConnected(receiverName)
-			if isConnected == false {
-				pushDataIntoAllChannelsForUser(userName, "User: "+receiverName+" is offline!")
-				log.Println("User: " + receiverName + " is offline!")
+			if isPresent == false {
+				pushDataIntoAllChannelsForUser(userName, "User: "+receiverName+" has not signed up yet")
+				log.Println("User: " + receiverName + " has not signed up yet")
 				continue
 			}
 
@@ -393,6 +572,20 @@ func wsConnection(w http.ResponseWriter, r *http.Request) {
 			if isPresent == false {
 				pushDataIntoAllChannelsForUser(userName, "No messageText found")
 				log.Println("No messageText found")
+				continue
+			}
+
+			errMsg, isSuccessful := dbInsertNewMessage(userName, receiverName, messageText)
+			if isSuccessful == false {
+				log.Print(errMsg)
+				pushDataIntoAllChannelsForUser(userName, "Internal server error!")
+				continue
+			}
+
+			isConnected := checkIfUserConnected(receiverName)
+			if isConnected == false {
+				pushDataIntoAllChannelsForUser(userName, "User: "+receiverName+" is offline, however, "+receiverName+" will be able to see this message later as we have saved your message!")
+				log.Println("User: " + receiverName + " is offline, however, " + receiverName + " will be able to see this message later as we have saved your message!")
 				continue
 			}
 
@@ -429,7 +622,7 @@ func signup(w http.ResponseWriter, r *http.Request) {
 	}
 	byteBodyArr, _ := ioutil.ReadAll(r.Body)
 	r.Body = ioutil.NopCloser(bytes.NewBuffer(byteBodyArr))
-	fmt.Println("In signup>", string(byteBodyArr))
+
 	var dataDict = make(map[string]string)
 	json.Unmarshal(byteBodyArr, &dataDict)
 	userName, _ := dataDict["userName"]
@@ -450,14 +643,41 @@ func signup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	_, isFound, errMsg, isSuccessful := dbGetPassword(userName)
+	if isSuccessful == false {
+		log.Print(errMsg)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	if isFound == true {
+		jsonResponseByteArr, jsonErr := json.Marshal("You have already signed up before!")
+		if jsonErr != nil {
+			log.Print("json encode error occured:", jsonErr)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		log.Print("You have already signed up before!")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		fmt.Fprintf(w, string(jsonResponseByteArr))
+		return
+	}
+
 	jsonResponseByteArr, jsonErr := json.Marshal("Signup Successful!")
 	if jsonErr != nil {
 		log.Print("json encode error occured:", jsonErr)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+
+	errMsg, isSuccessful = dbAddNewUserNameAndPassword(userName, password)
+	if isSuccessful == false {
+		log.Print(errMsg)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	putIntoUserNameToPassword(userName, password)
 	fmt.Fprintf(w, string(jsonResponseByteArr))
 }
 
@@ -486,11 +706,80 @@ func signin(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, string(jsonResponseByteArr))
 }
 
+func getLastNMessages(w http.ResponseWriter, r *http.Request) {
+	message, statusCode, isSuccessful := verifyRequestSanity(r)
+	if isSuccessful == false {
+		w.WriteHeader(statusCode)
+		fmt.Fprintf(w, message)
+		return
+	}
+
+	message, statusCode, isSuccessful = authenticate(r)
+	if isSuccessful == false {
+		w.WriteHeader(statusCode)
+		fmt.Fprintf(w, message)
+		return
+	}
+
+	byteBodyArr, _ := ioutil.ReadAll(r.Body)
+	r.Body = ioutil.NopCloser(bytes.NewBuffer(byteBodyArr))
+
+	var dataDict = make(map[string]string)
+	json.Unmarshal(byteBodyArr, &dataDict)
+	userName, _ := dataDict["userName"]
+	receiverName, isPresent := dataDict["receiverName"]
+	if isPresent == false {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "Request must contain receiverName!")
+		return
+	}
+
+	N, isPresent := dataDict["N"]
+	if isPresent == false {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "Request must contain N: The number of most recent messages required!")
+		return
+	}
+
+	intN, err := strconv.Atoi(N)
+	if err != nil {
+		log.Print(err.Error())
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "N must be an integer")
+		return
+	}
+
+	msgs, errMsg, isSuccessful := dbGetLastNMessages(userName, receiverName, intN)
+	if isSuccessful == false {
+		log.Print(errMsg)
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Internal Server Error!")
+		return
+	}
+
+	jsonByteArr, err := json.Marshal(msgs)
+	if err != nil {
+		log.Print(err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Json encoding error")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, string(jsonByteArr))
+}
+
 func main() {
+	dbcon, err := sql.Open("mysql", dbUserName+":"+dbPassword+"@tcp("+dbServerIP+")/"+dbName)
+	if err != nil {
+		panic(err.Error())
+	}
+	db = dbcon
+	defer dbcon.Close()
 	flag.Parse()
 	log.SetFlags(0)
 	http.HandleFunc("/wsconnection", wsConnection)
 	http.HandleFunc("/signup", signup)
 	http.HandleFunc("/signin", signin)
+	http.HandleFunc("/getlastnmessages", getLastNMessages)
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }

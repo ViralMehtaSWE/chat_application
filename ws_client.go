@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -15,7 +16,9 @@ import (
 )
 
 var randomReceiverName string = "asbcfjhawkljxqwejhcqihjvgkoelpwdvhgwcpq"
-var globalServerIP string = "3.7.96.64"
+
+//var globalServerIP string = "0.0.0.0"
+var globalServerIP string = "XXXX"
 var globalServerURLHTTP string = "http://" + globalServerIP + ":8080"
 var globalServerURLWS string = "ws://" + globalServerIP + ":8080"
 var globalPrompt string = ">"
@@ -88,6 +91,10 @@ func signup(userName string, password string) (msg string, isSuccessful bool) {
 }
 
 func signin(userName string, password string) (msg string, isSuccessful bool) {
+	if (getGlobalWsConnection() != nil) || (getGlobalUsername() != "") {
+		return "Please signout to signin again!", false
+	}
+
 	var mp = make(map[string]string)
 	mp["userName"] = userName
 	mp["password"] = password
@@ -152,6 +159,47 @@ func send(receiverName string, messageText string) (string, bool) {
 		return "Failed to send message!", false
 	}
 	return "", true
+}
+
+func getLastNMessages(receiverName string, N string) ([]string, string, bool) {
+	if (getGlobalWsConnection() == nil) || (getGlobalUsername() == "") {
+		return []string{}, "Please login to get last N messages!", false
+	}
+	var mp = make(map[string]string)
+	mp["userName"] = getGlobalUsername()
+	mp["password"] = getGlobalPassword()
+	mp["receiverName"] = receiverName
+	mp["N"] = N
+
+	b := new(bytes.Buffer)
+	jsonErr := json.NewEncoder(b).Encode(mp)
+	if jsonErr != nil {
+		return []string{}, "Application error occured during json encoding!", false
+	}
+	resp, err := http.Post(globalServerURLHTTP+"/getlastnmessages", "application/text; charset=utf-8", b)
+	if err != nil {
+		return []string{}, "Chat server is either offline or not accepting new connections! Please try later! Error msg: " + err.Error(), false
+	}
+	byteBodyArr, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return []string{}, "Error occured while reading response body!, Error msg: " + err.Error(), false
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		var decodedData []string
+		jsonErr = json.Unmarshal(byteBodyArr, &decodedData)
+		if jsonErr != nil {
+			return []string{}, "Application error occured during json encoding!", false
+		}
+		return decodedData, "", true
+	}
+
+	var decodedData string
+	jsonErr = json.Unmarshal(byteBodyArr, &decodedData)
+	if jsonErr != nil {
+		return []string{}, "Application error occured during json encoding!", false
+	}
+	return []string{}, decodedData, true
 }
 
 func main() {
@@ -220,6 +268,32 @@ func main() {
 				var messageText string = strings.Join(commandParts[2:], " ")
 				msg, _ := send(receiverName, messageText)
 				fmt.Println(msg)
+			}
+		} else if commandParts[0] == "getLastN" {
+			if len(commandParts) < 3 {
+				fmt.Println("Error! getLastN command format: getLastN <userName> <N>")
+			} else {
+				var receiverName string = commandParts[1]
+				var N string = commandParts[2]
+				intN, err := strconv.Atoi(N)
+				if err != nil {
+					fmt.Println("Parameter N must be of type int!")
+				} else {
+					lastNMessages, errMsg, isSuccessful := getLastNMessages(receiverName, N)
+					if isSuccessful == true {
+						if len(lastNMessages) < intN {
+							fmt.Println("Only", len(lastNMessages), "messages found!")
+						}
+						if len(lastNMessages) > 0 {
+							fmt.Println("The last", len(lastNMessages), "messages are:")
+							for index, msg := range lastNMessages {
+								fmt.Println(index+1, msg)
+							}
+						}
+					} else {
+						fmt.Println(errMsg)
+					}
+				}
 			}
 		} else {
 			fmt.Println("Invalid command!")
